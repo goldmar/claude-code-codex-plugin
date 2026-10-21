@@ -12,10 +12,17 @@ export const registryDir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(
 
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(id)
 const strings = value => Array.isArray(value) && value.every(item => typeof item === 'string')
+const validChildren = children => children === undefined || (Array.isArray(children) && children.length <= 64 &&
+  new Set(children.map(child => child?.threadId)).size === children.length && children.every(child => child &&
+    validId(child.threadId) && validId(child.parentThreadId) && child.threadId !== child.parentThreadId &&
+    typeof child.name === 'string' && child.name.length <= 80 && typeof child.message === 'string' && child.message.length <= 500 &&
+    ['pendingInit', 'running', 'interrupted', 'completed', 'errored', 'shutdown', 'notFound', 'idle', 'unknown'].includes(child.status) &&
+    [child.ownerTurnId, child.currentTurnId, child.lastTurnId].every(value => value === null || validId(value)) &&
+    Object.keys(child).every(key => ['threadId', 'parentThreadId', 'name', 'message', 'status', 'ownerTurnId', 'currentTurnId', 'lastTurnId'].includes(key))))
 const validAgent = agent => agent && validId(agent.id) && typeof agent.threadId === 'string' &&
   ['name', 'model', 'effort', 'cwd', 'lastMessage', 'activity', 'sessionId'].every(key => typeof agent[key] === 'string') &&
   ['updatedAt', 'startedAt', 'turnStartedAt', 'turnEndedAt', 'tokens'].every(key => Number.isFinite(agent[key])) &&
-  strings(agent.digest) && (agent.outbox === undefined || strings(agent.outbox)) &&
+  strings(agent.digest) && (agent.outbox === undefined || strings(agent.outbox)) && validChildren(agent.children) &&
   ['read-only', 'workspace-write', 'full-access'].includes(agent.sandbox) &&
   ['ask', 'auto', 'never', 'yolo'].includes(agent.approvals) &&
   [agent.currentTurnId, agent.lastTurnId, agent.lastTurnStatus, agent.error].every(value => value === null || typeof value === 'string') &&

@@ -7,6 +7,36 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { readAgents, serveRegistry, writeAgent } from '../bin/registry.mjs'
 
+test('0.2.10 and goldmar.1 records are found by restored ID or name without rewriting their bytes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-legacy-'))
+  try {
+    for (const [id, outbox] of [['upstream', undefined], ['goldmar1', []]]) {
+      // Fields written by both historical newAgent implementations; all newer
+      // capacity and stop fields are optional. Very old outbox is also optional.
+      const agent = {
+        id, name: `helper-${id}`, description: 'fixture', threadId: `thread-${id}`, sessionId: 'previous-session',
+        model: 'gpt-6.1-sol', effort: 'high', sandbox: 'workspace-write', approvals: 'ask', cwd: '/fixture',
+        status: 'idle', currentTurnId: null, lastTurnId: 'previous-turn', lastTurnStatus: 'completed',
+        lastMessage: 'fixture result', activity: '', tokens: 0, error: null, msgKey: `key-${id}`, digest: [],
+        startedAt: 1, updatedAt: 2, turnStartedAt: 1, turnEndedAt: 2, ...(outbox ? { outbox } : {}),
+      }
+      const file = path.join(dir, `${id}.json`)
+      const bytes = JSON.stringify(agent)
+      fs.writeFileSync(file, bytes)
+      for (const query of [{ sessionId: 'restored-session', ids: [id] }, { ref: id }, { ref: agent.name }]) {
+        const found = readAgents(query, dir)[id]
+        assert.equal(found.threadId, agent.threadId)
+        assert.equal(found.sandbox, agent.sandbox)
+        assert.equal(found.approvals, agent.approvals)
+        assert.deepEqual(found.outbox, [])
+      }
+      assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'reads must not migrate live files in place')
+      fs.writeFileSync(path.join(dir, `bad-${id}.json`), JSON.stringify({ ...agent, id: `bad-${id}`, threadId: null }))
+      assert.deepEqual(readAgents({ ref: `bad-${id}` }, dir), {})
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('separate sessions persist independently, survive registry-server restart, and retain stale records', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-test-'))
   const first = await serveRegistry(dir)
@@ -23,6 +53,12 @@ test('separate sessions persist independently, survive registry-server restart, 
     sandbox: 'workspace-write', approvals: 'ask', currentTurnId: null, lastTurnId: null, lastTurnStatus: null, error: null,
   })
   try {
+    const withChild = { ...agent('parent', 'old-session'), children: [{ threadId: 'child', parentThreadId: 'thread-parent', name: 'reviewer', status: 'running', message: 'Checking.', ownerTurnId: 'turn', currentTurnId: 'child-turn', lastTurnId: null }] }
+    writeAgent(withChild, dir)
+    assert.deepEqual(readAgents({ ref: 'parent' }, dir).parent.children, withChild.children)
+    for (const children of [Array(65).fill(withChild.children[0]), [{ ...withChild.children[0], message: 'x'.repeat(501) }], [{ ...withChild.children[0], status: 'invented' }], [{ ...withChild.children[0], prompt: 'raw prompt' }]]) {
+      assert.throws(() => writeAgent({ ...withChild, children }, dir), /invalid Codex agent/)
+    }
     await Promise.all([
       call(first, 'write', { agent: agent('a1', 'old-session') }),
       call(second, 'write', { agent: agent('a2', 'other-session') }),
@@ -31,6 +67,7 @@ test('separate sessions persist independently, survive registry-server restart, 
     first.server.closeAllConnections()
     await new Promise(resolve => first.server.close(resolve))
     restarted = await serveRegistry(dir)
+    assert.deepEqual((await call(restarted, 'read', { ref: 'parent' })).agents.parent.children, withChild.children)
     const recovered = await call(restarted, 'read', { sessionId: 'new-session', ids: ['a1'] })
     assert.equal(recovered.agents.a1.threadId, 'thread-a1')
     assert.equal(recovered.agents.a1.lastMessage, agent('a1', 'old-session').lastMessage)
@@ -39,7 +76,7 @@ test('separate sessions persist independently, survive registry-server restart, 
     assert.equal((await call(restarted, 'read', { ref: 'a2' })).agents.a2.threadId, 'thread-a2')
     writeAgent({ ...agent('a1', 'old-session'), updatedAt: 1, status: 'running' }, dir)
     assert.equal(readAgents({ ids: ['a1'] }, dir).a1.status, 'interrupted')
-    assert.deepEqual(fs.readdirSync(dir).sort(), ['a1.json', 'a2.json'])
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['a1.json', 'a2.json', 'parent.json'])
     // A corrupt record cannot hide its intact neighbor.
     fs.writeFileSync(path.join(dir, 'broken.json'), '{')
     assert.equal(readAgents({ ids: ['a1'] }, dir).a1.threadId, 'thread-a1')

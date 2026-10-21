@@ -3,6 +3,18 @@ export type CodexSandbox = 'read-only' | 'workspace-write' | 'full-access'
 export type CodexApprovals = 'ask' | 'auto' | 'never' | 'yolo'
 export type CodexStatus = 'starting' | 'running' | 'idle' | 'interrupted' | 'failed'
 
+/** Display-only collaboration descendants; never independent Claude wrappers. */
+export type CodexChild = {
+  threadId: string
+  parentThreadId: string
+  name: string
+  status: 'pendingInit' | 'running' | 'interrupted' | 'completed' | 'errored' | 'shutdown' | 'notFound' | 'idle' | 'unknown'
+  message: string
+  ownerTurnId: string | null
+  currentTurnId: string | null
+  lastTurnId: string | null
+}
+
 /** One Codex job: a Codex thread run under a native `codex:<alias>` subagent, keyed by that subagent's agentId. */
 export type CodexAgent = {
   /** The native subagent's agentId, which SendMessage and TaskStop take. */
@@ -16,6 +28,8 @@ export type CodexAgent = {
   sandbox: CodexSandbox
   approvals: CodexApprovals
   cwd: string
+  /** At most 64 sanitized descendants, retained with their owning job. */
+  children?: CodexChild[]
   status: CodexStatus
   /** The running turn, null when none runs. */
   currentTurnId: string | null
@@ -31,6 +45,16 @@ export type CodexAgent = {
   error: string | null
   /** The latest non-terminal Codex error (a retry, a failed compaction, work after a reported end); the job runs on. */
   warning?: string | null
+  /** A requested stop fences automatic capacity retries until explicit new input. */
+  stopRequested?: boolean
+  /** Bounded retries of a confirmed capacity rejection, persisted across hook reloads. */
+  capacityAttempts?: number
+  capacityStartedAt?: number
+  capacityNotBefore?: number
+  /** Original input for capacity-only retries on this same thread/model. */
+  capacityInput?: string
+  /** Any item observed for the current input prevents automatic repetition. */
+  capacityWorkObserved?: boolean
   /** The key bin/codex-msg names this job by (in the thread's developer instructions). */
   msgKey: string
   /** codex-msg messages read from the bridge and not yet passed on to the main session. */

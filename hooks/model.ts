@@ -6,6 +6,7 @@
 import type { EngineInterface, ToolSpec } from 'claude-code'
 
 import type { CodexAgent, CodexApprovals, CodexSandbox } from '../types'
+import { redactActivity } from './activity'
 
 export type Settings = {
   codexPath: string
@@ -23,8 +24,13 @@ export type BridgeEvent =
   | { type: 'exit'; code: number | null; signal: string | null; stderrTail: string[] }
   | { type: 'fatal'; message: string; logTail: string }
 
-/** A failure to show the model as the tool's error. */
-export class CodexError extends Error {}
+/** Preserve the protocol classification; a transport timeout is never an idle receipt. */
+export class CodexError extends Error {
+  constructor(message: string, readonly code?: number, readonly data?: unknown) {
+    super(message)
+    this.name = 'CodexError'
+  }
+}
 
 /** Where $.http.fetch sends a bridge endpoint: over the daemon's Unix socket, or on Windows to its loopback URL, which carries the daemon's secret (bin/bridge.mjs). */
 export const bridgeTarget = (socket: string, endpoint: string): { url: string; socketPath?: string } =>
@@ -417,6 +423,23 @@ export function afterTurn(agent: CodexAgent, turn: Record<string, unknown>, now:
   }
 }
 
+/** A new attempt is safe only after a structured terminal overload with no
+ * observed work. Transport errors, prose matching and server-owned retries
+ * never authorize repeating input that may have produced side effects.
+ */
+export function overloadRetryDelay(agent: CodexAgent, turn: Record<string, unknown>, now: number): number | null {
+  const error = turn.error as Record<string, unknown> | null | undefined
+  if (turn.status !== 'failed' || error?.codexErrorInfo !== 'serverOverloaded' || turn.willRetry === true || error.willRetry === true) return null
+  if (!Array.isArray(turn.items) || turn.items.some(item => !item || typeof item !== 'object' || (item as { type?: unknown }).type !== 'userMessage') || agent.capacityWorkObserved === true) return null
+  if (!agent.capacityInput || (agent.capacityAttempts ?? 0) >= 2) return null
+  const attempt = agent.capacityAttempts ?? 0
+  const started = agent.capacityStartedAt ?? agent.turnStartedAt
+  const hint = error.retryAfterMs ?? turn.retryAfterMs
+  if (hint !== undefined && (typeof hint !== 'number' || !Number.isFinite(hint) || hint < 0)) return null
+  const delay = Math.max(2000 * (attempt + 1), typeof hint === 'number' ? hint : 0)
+  return now - started + delay <= 120_000 ? delay : null
+}
+
 // ------------------------------------------------------------ approvals
 
 export const ALLOW_ONCE = 'Allow once'
@@ -677,10 +700,11 @@ export function agentDescription(alias: string, defaults: Defaults): string {
     `${WHEN_TO_USE[alias]} OpenAI Codex on the newest ${family} model, effort ${effortFor(defaults, alias)}.`,
     'Codex gets your prompt verbatim, sees nothing of this conversation, and its final message is the result. Always runs in the background.',
     'Optional header lines at the top of the prompt, stripped before Codex sees it:',
+    '"cwd: <path>" (absolute or relative to the Claude session project root; default that root, never a shell cd);',
     `"effort: ${effortsOf(alias)}";`,
     `"sandbox: read-only|workspace-write|full-access" (OS-enforced; workspace-write writes only in the cwd plus the temp directory; default ${defaults.sandbox});`,
     `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it).`,
-    `Project defaults: ${PROJECT_CONFIG}.`,
+    `Project defaults: ${PROJECT_CONFIG}, read from the effective cwd toward its project root. Effective cwd and collaboration children appear in codex_list; child activity appears in this agent's transcript.`,
     'Codex may message you mid-task as this agent. SendMessage to it steers the running Codex turn, or starts a new turn on the same thread once it finished; TaskStop interrupts it.',
   ].join(' ')
 }
@@ -706,13 +730,13 @@ export const agentSpecs = (defaults: Defaults): AgentSpec[] =>
     omitClaudeMd: true,
   }))
 
-const HEADER_KEYS = ['effort', 'sandbox', 'approvals'] as const
+const HEADER_KEYS = ['effort', 'sandbox', 'approvals', 'cwd'] as const
 type HeaderKey = (typeof HEADER_KEYS)[number]
 export type PromptHeader = Partial<Record<HeaderKey, string>> & { body: string }
 
-const HEADER_LINE = /^[ \t]*(effort|sandbox|approvals)[ \t]*:[ \t]*(\S+)[ \t]*$/i
+const HEADER_LINE = /^[ \t]*(effort|sandbox|approvals|cwd)[ \t]*:[ \t]*(.*?)[ \t]*\r?$/i
 
-/** Reads the `effort:`, `sandbox:` and `approvals:` lines at the top of a prompt; `body` is the rest, as given. */
+/** Reads leading run headers only; paths preserve case and spaces. */
 export function parseHeader(prompt: string): PromptHeader {
   const lines = prompt.split('\n')
   const header: PromptHeader = { body: prompt }
@@ -722,11 +746,31 @@ export function parseHeader(prompt: string): PromptHeader {
     if (!match) break
     const key = (match[1] as string).toLowerCase() as HeaderKey
     if (header[key] !== undefined) throw new CodexError(`the prompt's header sets ${key} twice`)
-    header[key] = (match[2] as string).toLowerCase()
+    const value = (match[2] as string).trim()
+    if (!value || /[\x00-\x1f\x7f]/.test(value)) throw new CodexError(`the prompt's ${key} header is empty or contains control characters`)
+    header[key] = key === 'cwd' ? value : value.toLowerCase()
     count += 1
   }
-  if (count > 0) header.body = lines.slice(count).join('\n').replace(/^(?:[ \t]*\n)+/, '')
+  if (count > 0) header.body = lines.slice(count).join('\n').replace(/^(?:[ \t]*\r?\n)+/, '')
   return header
+}
+
+/** Resolve without a shell, expansion, or dependence on a transient shell cwd. */
+export function resolveCwd(value: string | undefined, root: string): string {
+  if (value === undefined) return root
+  if (/^[~]|^[A-Za-z]:[^\\/]/.test(value)) throw new CodexError('cwd must be an absolute path or a path relative to the session project root; shell expansion is not supported')
+  const windows = /^[A-Za-z]:[\\/]|^\\\\/.test(root) || /^[A-Za-z]:[\\/]|^\\\\/.test(value)
+  const absolute = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(value) ? value : `${root}/${value}`
+  const normalized = windows ? absolute.replaceAll('\\', '/') : absolute
+  const prefix = normalized.match(/^(?:[A-Za-z]:\/|\/\/[^/]+\/[^/]+\/?|\/)/)?.[0]
+  if (!prefix) throw new CodexError('the session project root must be absolute')
+  const parts: string[] = []
+  for (const part of normalized.slice(prefix.length).split('/')) {
+    if (part === '..') parts.pop()
+    else if (part && part !== '.') parts.push(part)
+  }
+  const path = `${prefix.replace(/\/$/, '')}/${parts.join('/')}`
+  return windows ? path.replaceAll('/', '\\') : path
 }
 
 /** The wrapper's final answer once the Codex turn ended: on success the Codex final message, verbatim. */
@@ -743,7 +787,7 @@ export function describeAgent(agent: CodexAgent, now: number): string {
   // Finish age omits seconds once at least a minute elapsed; runtime keeps them.
   const timing = isLive(agent) ? (time ? ` ${time}` : '') : time ? `, ran ${time}, finished ${elapsed(agent.turnEndedAt, now).replace(/m \d+s$/, 'm')} ago` : ''
   const doing = isLive(agent) ? agent.activity : (agent.lastTurnStatus ?? agent.status)
-  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${timing}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}`
+  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${timing}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}; cwd: ${redactActivity(agent.cwd, 1000)}`
 }
 
 const RECENT_FINISHED_MS = 30 * 60_000
@@ -752,11 +796,11 @@ const RECENT_FINISHED_MS = 30 * 60_000
 export function listText(agents: readonly CodexAgent[], sessionId: string, now: number, all = false): string {
   const mine = agents.filter(agent => agent.sessionId === sessionId)
   if (mine.length === 0) return 'No Codex agents in this session. The Agent tool starts one with subagent_type codex:luna, codex:sol, codex:astra or codex:terra.'
-  const shown = all ? mine : mine.filter(agent => isLive(agent) || agent.turnEndedAt >= now - RECENT_FINISHED_MS)
+  const shown = all ? mine : mine.filter(agent => isLive(agent) || agent.children?.some(child => ['running', 'pendingInit'].includes(child.status)) || agent.turnEndedAt >= now - RECENT_FINISHED_MS)
   const hidden = mine.length - shown.length
   const notice = `${hidden} older finished jobs hidden; codex_list with all: true lists them. codex_result and SendMessage still reach any of them.`
   if (shown.length === 0) return `No active or recently finished Codex jobs in this session; ${notice}`
-  return [...shown.map(agent => describeAgent(agent, now)), ...(hidden > 0 ? [notice] : [])].join('\n')
+  return [...shown.flatMap(agent => [describeAgent(agent, now), ...(agent.children ?? []).map(child => `  ↳ ${redactActivity(child.name, 80)} [${child.status}]${child.message ? `: ${redactActivity(child.message, 500)}` : ''}`)]), ...(hidden > 0 ? [notice] : [])].join('\n')
 }
 
 export function resultText(agent: CodexAgent, full: boolean, now: number): string {
@@ -795,7 +839,7 @@ export const STILL_RUNNING = 'Codex is still running'
 export function rowResult(tool: ToolName, text: string): { main: string; dim: string } {
   switch (tool) {
     case 'codex_list': {
-      const lines = text.split('\n').filter(line => / \[[^\]]*\] \w+/.test(line))
+      const lines = text.split('\n').filter(line => !line.startsWith('  ↳ ') && / \[[^\]]*\] \w+/.test(line))
       if (lines.length === 0) return { main: 'No agents', dim: '' }
       const running = lines.filter(line => /\] (running|starting)\b/.test(line)).length
       return { main: `${lines.length} agent${lines.length === 1 ? '' : 's'} · ${running} running`, dim: '' }
@@ -825,7 +869,7 @@ const ID_PARAM = { type: 'string', description: "The agent id (the codex:* agent
 export const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'codex_list',
-    description: "List this session's active Codex jobs (codex:* agents) and jobs finished within the last 30 minutes, newest first: model, status and what each is doing. With all=true, list the full history, including restored, interrupted and missing jobs. codex_result and SendMessage still reach hidden jobs.",
+    description: "List this session's active Codex jobs (codex:* agents) and jobs finished within the last 30 minutes, newest first: model, effective cwd, status and activity, with collaboration children and their statuses under each parent. With all=true, list the full history, including restored, interrupted and missing jobs. codex_result and SendMessage still reach hidden jobs.",
     inputSchema: { type: 'object', properties: { all: { type: 'boolean', description: 'List the full session history, including older finished jobs (default false).' } } },
   },
   {
